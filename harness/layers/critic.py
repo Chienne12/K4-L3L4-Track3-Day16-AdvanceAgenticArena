@@ -79,16 +79,87 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            return report
+
+        observed = ctx.observed_text
+        kept = []
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+
+            # A claim already present in an observation is kept byte-for-byte.
+            if text in observed:
+                kept.append(claim)
+                continue
+
+            # A contradiction claim may be two model-written quotations
+            # joined by " và ". Split only when both halves are observed and
+            # each half is a substring of one retrieved line from a different
+            # document. Never invent or normalise quotation text.
+            if ctx.corpus is None:
+                continue
+            cursor = 0
+            split = False
+            while True:
+                pivot = text.find(" và ", cursor)
+                if pivot < 0:
+                    break
+                cursor = pivot + len(" và ")
+                left = text[:pivot]
+                right = text[cursor:]
+                if not left or not right or left not in observed or right not in observed:
+                    continue
+
+                left_docs = [
+                    doc for doc in ctx.corpus.docs
+                    if doc.body in observed
+                    and any(left in line for line in doc.body.splitlines())
+                ]
+                right_docs = [
+                    doc for doc in ctx.corpus.docs
+                    if doc.body in observed
+                    and any(right in line for line in doc.body.splitlines())
+                ]
+                pair = next(
+                    (
+                        (left_doc, right_doc)
+                        for left_doc in left_docs
+                        for right_doc in right_docs
+                        if left_doc.doc_id != right_doc.doc_id
+                    ),
+                    None,
+                )
+                if pair is None:
+                    continue
+
+                left_doc, right_doc = pair
+                kept.append({**claim, "text": left, "doc_id": left_doc.doc_id})
+                kept.append({**claim, "text": right, "doc_id": right_doc.doc_id})
+                report["abstain"] = True
+                split = True
+                break
+
+            # If no split was possible, this claim is unsupported and is
+            # deliberately omitted so it cannot be scored as hallucinated.
+            if split:
+                continue
+
+        report["claims"] = kept
+        report["citations"] = sorted({
+            claim["doc_id"]
+            for claim in kept
+            if isinstance(claim.get("doc_id"), str)
+        })
+
+        if not kept:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ từ tài liệu đã đọc để trả lời."
+        return report
